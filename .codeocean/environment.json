@@ -1,0 +1,45 @@
+{
+	"version": 1,
+	"base_image": "codeocean/swdb:Python3.12code-server4.133bedrock-auth0.5.0",
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true,
+		"mount_secrets": true
+	},
+	"installers": {
+		"conda": {
+			"packages": [
+				{
+					"name": "jupyterlab"
+				}
+			]
+		},
+		"pip": {
+			"packages": [
+				{
+					"name": "aind-data-access-api"
+				},
+				{
+					"name": "hdmf-zarr"
+				},
+				{
+					"name": "matplotlib"
+				},
+				{
+					"name": "numpy"
+				},
+				{
+					"name": "pandas"
+				},
+				{
+					"name": "pynwb"
+				},
+				{
+					"name": "scipy"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		}
+	}
+}
