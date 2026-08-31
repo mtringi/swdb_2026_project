@@ -1,6 +1,7 @@
 {
 	"version": 1,
 	"base_image": "codeocean/swdb:Python3.12code-server4.133bedrock-auth0.5.0",
+	"post_install": true,
 	"options": {
 		"registry_host_arg": true,
 		"git_ask_pass": true,
@@ -10,32 +11,56 @@
 		"conda": {
 			"packages": [
 				{
-					"name": "jupyterlab"
+					"name": "jupyterlab",
+					"version": "4.6.3"
 				}
 			]
 		},
 		"pip": {
 			"packages": [
 				{
-					"name": "aind-data-access-api"
+					"name": "aind-data-access-api",
+					"version": "1.10.0"
 				},
 				{
-					"name": "hdmf-zarr"
+					"name": "dynamax[notebooks]",
+					"version": "1.0.2"
 				},
 				{
-					"name": "matplotlib"
+					"name": "hdmf-zarr",
+					"version": "0.13.0"
 				},
 				{
-					"name": "numpy"
+					"name": "jax",
+					"version": "0.11.1"
 				},
 				{
-					"name": "pandas"
+					"name": "matplotlib",
+					"version": "3.11.1"
 				},
 				{
-					"name": "pynwb"
+					"name": "numpy",
+					"version": "2.5.2"
 				},
 				{
-					"name": "scipy"
+					"name": "pandas",
+					"version": "3.0.5"
+				},
+				{
+					"name": "pynwb",
+					"version": "4.1.0"
+				},
+				{
+					"name": "scikit-learn",
+					"version": "1.9.0"
+				},
+				{
+					"name": "scipy",
+					"version": "1.18.1"
+				},
+				{
+					"name": "seaborn",
+					"version": "0.13.2"
 				}
 			],
 			"options": {},
