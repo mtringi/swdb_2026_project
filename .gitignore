@@ -1,6 +1,6 @@
 # Code Ocean specific files and directories
 /data/
-/results/
+# /results/
 /scratch/
 metadata/metadata.yml
 
