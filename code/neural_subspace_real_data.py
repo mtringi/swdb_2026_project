@@ -894,6 +894,66 @@ def run_real_data_analysis(config=CONFIG, spike_table=None, trial_table=None):
                         out_dir, f"real_subspace_{stim}_correct_vs_incorrect_top{n_cmp}pcs.png"),
                 )
 
+    # ---- 8c-2. Hit vs. correct-reject to the same physical stimulus: unlike
+    # 8c (which holds the motor output/lick fixed and varies context), this
+    # holds context-correctness of the *stimulus* the same conceptual
+    # "irrelevant" side but instead contrasts the matched-context go response
+    # against the mismatched-context correctly-withheld response -- i.e. it
+    # includes the correct-reject trials that 8c intentionally excludes, at
+    # the cost of also varying licked/not-licked between the two groups.
+    for stim, modality in unique_stims:
+        is_this_stim = (stim_id == stim)
+        matched_ctx = is_this_stim & (context == modality) & (outcome == "hit")
+        mismatched_ctx_cr = is_this_stim & (context != modality) & (outcome == "correct_reject")
+        if len(matched_ctx.nonzero()[0]) >= 2 and len(mismatched_ctx_cr.nonzero()[0]) >= 2:
+            hit_idx = np.where(matched_ctx)[0]
+            cr_idx = np.where(mismatched_ctx_cr)[0]
+            print(f"stim={stim!r}: hit (context-matched) n={len(hit_idx)}, "
+                  f"correct-reject (context-mismatched) n={len(cr_idx)}")
+            plot_stim_correct_vs_incorrect(
+                pc_trials, hit_idx, cr_idx, time_bins,
+                stim_label=str(stim),
+                correct_label=f"Hit {stim} (matched context)",
+                incorrect_label=f"Correct reject {stim} (mismatched context)",
+                pcx=0, pcy=1,
+                title=f"Hit vs. correct-reject {stim} response (real data)",
+                save_path=os.path.join(
+                    out_dir, f"real_subspace_{stim}_hit_vs_correct_reject.png"),
+            )
+
+    # ---- 8c-3. Context modulation of a non-target stimulus's representation,
+    # holding *both* physical stimulus and behavioral output fixed: for a
+    # stimulus that is correctly rejected regardless of which block it falls
+    # in (e.g. aud2/vis2 -- distractors that are never the current block's
+    # target), compare correct-reject trials when its own modality matches
+    # the block context vs. when it doesn't. Both groups are correct-reject
+    # (no lick either way), so any separation here can't be attributed to a
+    # difference in overt motor output or in correctness -- it isolates a
+    # pure context effect on the same stimulus/response pair. This loop
+    # naturally produces plots only for stimuli that have enough
+    # correct-reject trials in *both* contexts (i.e. non-target stimuli);
+    # target stimuli are essentially never correctly rejected when their
+    # modality matches the block, so they drop out on the trial-count check.
+    for stim, modality in unique_stims:
+        is_this_stim = (stim_id == stim)
+        matched_cr = is_this_stim & (context == modality) & (outcome == "correct_reject")
+        mismatched_cr = is_this_stim & (context != modality) & (outcome == "correct_reject")
+        if len(matched_cr.nonzero()[0]) >= 2 and len(mismatched_cr.nonzero()[0]) >= 2:
+            matched_idx = np.where(matched_cr)[0]
+            mismatched_idx = np.where(mismatched_cr)[0]
+            print(f"stim={stim!r}: correct-reject, matched context n={len(matched_idx)}, "
+                  f"correct-reject, mismatched context n={len(mismatched_idx)}")
+            plot_stim_correct_vs_incorrect(
+                pc_trials, matched_idx, mismatched_idx, time_bins,
+                stim_label=str(stim),
+                correct_label=f"Correct reject {stim} (matched context)",
+                incorrect_label=f"Correct reject {stim} (mismatched context)",
+                pcx=0, pcy=1,
+                title=f"Context effect on correctly-rejected {stim} response (real data)",
+                save_path=os.path.join(
+                    out_dir, f"real_subspace_{stim}_correct_reject_context_effect.png"),
+            )
+
     # ---- 8d. Choice axis (lick vs. no-lick mean-difference direction)
     choice_axis = mean_difference_axis(rates, licked, ~licked,
                                          subspace.mean_, subspace.std_)
