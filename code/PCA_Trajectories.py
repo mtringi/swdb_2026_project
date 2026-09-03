@@ -348,6 +348,10 @@ plt.show()
 #               8 legend entries, each toggling on its own. TRIALS_3D_COMBOS
 #               optionally limits which classes contribute, e.g.
 #               {("sound2", "aud")}.
+# With MARK_REWARD_SCHEDULED, the task-switch trials (is_reward_scheduled: the
+# 5 instruction trials that open each aud-rewarded block, 3 blocks -> 15, all
+# sound1) are pulled out of each overlay group into thin purple lines - deep
+# purple correct, light purple incorrect - each its own legend entry.
 #
 # ANIMATE_3D adds a Play/Pause button and a time slider that sweep every
 # trajectory - the 4 means (with a moving head marker) and, when TRIALS_3D is
@@ -360,6 +364,11 @@ TRIALS_3D_COMBOS = None     # None = all conditions; else a set of (stim, contex
 ANIMATE_3D = True           # add Play/Pause + a time slider; grows means and single trials
 EVENT_MARKERS_3D = True     # draw the trial-start / stimulus-onset markers (either way
                             # they are single legend entries you can click on/off)
+MARK_REWARD_SCHEDULED = True  # pull the task-switch (is_reward_scheduled / instruction)
+                             # trials out of each overlay group and draw them as thin
+                             # purple lines - deep purple correct, light purple incorrect -
+                             # with their own legend entry. These are the 5 instruction
+                             # trials that open every aud-rewarded block (3 blocks -> 15).
 
 pca3 = PCA(n_components=3)
 scores3 = pca3.fit_transform(flat_activity).reshape(n_trials_pca, n_bins_pca, 3)
@@ -372,6 +381,7 @@ var3 = 100 * pca3.explained_variance_ratio_
 
 correct_per_trial = aud_trials["is_correct"].to_numpy(dtype=bool)
 incorrect_per_trial = aud_trials["is_incorrect"].to_numpy(dtype=bool)
+sched_per_trial = aud_trials["is_reward_scheduled"].to_numpy(dtype=bool)
 
 combo_style = {
     ("sound1", "aud"): ("sound1 / aud-rewarded", "#1f5fa8"),
@@ -407,38 +417,50 @@ fig3d = go.Figure()
 # anim_trial_groups keeps (trace index, its (n, bins, 3) paths) so the frames
 # below can regrow each single trial along with the means.
 anim_trial_groups = []
+
+def _add_overlay(sel, color, label, base_name, showlegend, opacity, width, sched_color):
+    """Add the single-trial trace(s) for one group. With MARK_REWARD_SCHEDULED
+    the group is split: ordinary trials keep the group colour, while the
+    task-switch (is_reward_scheduled) trials are pulled out into a thin
+    ``sched_color`` (purple) line with its own legend entry."""
+    if MARK_REWARD_SCHEDULED:
+        parts = [(sel & ~sched_per_trial, color, False, showlegend, opacity, base_name),
+                 (sel & sched_per_trial, sched_color, True, True, max(opacity, 0.7),
+                  f"{base_name} · task-switch")]
+    else:
+        parts = [(sel, color, False, showlegend, opacity, base_name)]
+    for part_sel, part_color, is_sched, part_showlegend, part_opacity, part_name in parts:
+        if part_sel.sum() == 0:
+            continue
+        paths = scores3[part_sel]
+        gx, gy, gz = _paths_xyz(paths)
+        anim_trial_groups.append((len(fig3d.data), paths))
+        fig3d.add_trace(go.Scatter3d(
+            x=gx, y=gy, z=gz, mode="lines", opacity=part_opacity,
+            line=dict(color=part_color, width=width),
+            legendgroup=label, showlegend=part_showlegend or is_sched, hoverinfo="skip",
+            name=(f"{part_name} (n={int(part_sel.sum())})"
+                  if (part_showlegend or is_sched) else None)))
+
 if TRIALS_3D == "combo":
     for (stim_name, context), (label, color) in combo_style.items():
         mask = ((stim_name_per_trial == stim_name)
                 & (context_per_trial == context) & trial_subset)
-        if mask.sum() == 0:
-            continue
-        paths = scores3[mask]
-        xs, ys, zs = _paths_xyz(paths)
-        anim_trial_groups.append((len(fig3d.data), paths))
-        fig3d.add_trace(go.Scatter3d(
-            x=xs, y=ys, z=zs, mode="lines", opacity=0.12,
-            line=dict(color=color, width=1),
-            legendgroup=label, showlegend=False, hoverinfo="skip"))
+        _add_overlay(mask, color, label, label, showlegend=False, opacity=0.12, width=1,
+                     sched_color="#8e44ad")
 elif TRIALS_3D == "outcome":
     # correct / incorrect single trials, kept separate for each of the 4
     # stimulus x context classes; entries sit next to their class mean in the
-    # legend and toggle one at a time.
+    # legend and toggle one at a time. Task-switch trials of each outcome are
+    # split off into their own shade of purple (deep = correct, light = incorrect).
     for (stim_name, context), (label, _) in combo_style.items():
         combo_mask = (stim_name_per_trial == stim_name) & (context_per_trial == context)
-        for outcome, sel_all, ocolor in (("correct", correct_per_trial, "#2ca02c"),
-                                         ("incorrect", incorrect_per_trial, "#d62728")):
+        for outcome, sel_all, ocolor, pcolor in (
+                ("correct", correct_per_trial, "#2ca02c", "#6a1b9a"),
+                ("incorrect", incorrect_per_trial, "#d62728", "#c77dd6")):
             sel = combo_mask & sel_all & trial_subset
-            if sel.sum() == 0:
-                continue
-            paths = scores3[sel]
-            xs, ys, zs = _paths_xyz(paths)
-            anim_trial_groups.append((len(fig3d.data), paths))
-            fig3d.add_trace(go.Scatter3d(
-                x=xs, y=ys, z=zs, mode="lines", opacity=0.3,
-                line=dict(color=ocolor, width=1.5),
-                legendgroup=label, name=f"{label} - {outcome} (n={int(sel.sum())})",
-                hoverinfo="skip"))
+            _add_overlay(sel, ocolor, label, f"{label} - {outcome}",
+                         showlegend=True, opacity=0.3, width=1.5, sched_color=pcolor)
 
 anim_mean_idx, mean_paths, mean_colors = [], [], []
 for (stim_name, context), (label, color) in combo_style.items():
@@ -452,7 +474,7 @@ for (stim_name, context), (label, color) in combo_style.items():
     fig3d.add_trace(go.Scatter3d(
         x=m[:, 0], y=m[:, 1], z=m[:, 2], mode="lines+markers",
         line=dict(color=color, width=6), marker=dict(size=3, color=color),
-        legendgroup=label, name=f"{label} (n={int(mask.sum())})",
+        legendgroup=label, name=f"{label} - MEAN (n={int(mask.sum())})",
         customdata=np.arange(n_bins_pca),
         hovertemplate=("time bin %{customdata}<br>PC1 %{x:.2f}<br>"
                        "PC2 %{y:.2f}<br>PC3 %{z:.2f}<extra></extra>")))
