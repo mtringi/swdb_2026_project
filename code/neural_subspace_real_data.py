@@ -68,6 +68,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from scipy.ndimage import gaussian_filter1d
+from scipy.linalg import eigh
 
 
 # ==========================================================================
@@ -144,6 +145,240 @@ def build_condition_averages(rates, keys, min_trials=5):
             kept_keys.append(k)
             counts.append(int(n))
     return np.stack(avgs, axis=0), kept_keys, counts
+
+
+# ==========================================================================
+# 1b. Demixed PCA (dPCA): separate axes per task marginalization
+# ==========================================================================
+#
+# Ordinary PCA (section 1 above) finds axes that capture the most variance
+# overall, mixing "how activity changes over time" and "how activity
+# differs between conditions" into the same components. Demixed PCA (Kobak
+# et al. 2016, eLife, https://elifesciences.org/articles/10989) instead
+# splits the (condition x time) trial-averaged data into three additive
+# pieces before doing any dimensionality reduction:
+#
+#   X_t   "pure time"        -- the time course shared by every condition
+#                                (condition-collapsed average profile)
+#   X_c   "pure condition"   -- how each condition's overall level differs,
+#                                with no time dependence
+#   X_ct  "condition x time" -- everything left over: dynamics that differ
+#                                BETWEEN conditions (usually the interesting
+#                                one -- e.g. "when does the population
+#                                diverge between hit and miss")
+#
+# with X_t + X_c + X_ct = the (mean-subtracted) condition-averaged data.
+# This decomposition is exact/balanced here because every condition shares
+# the same T time bins (a complete condition x time grid), which is exactly
+# `cond_avg_rates` as already computed above for the ordinary PCA subspace.
+#
+# A SEPARATE set of principal-component-like axes is fit per marginalization
+# phi, using the regularized generalized-eigenvalue solution from the paper
+# (Methods, eqs. 5-8): decoder axes solve
+#
+#     C_phi @ w = gamma * (C + lambda * I) @ w
+#
+# where C_phi is the (neuron x neuron) covariance of that marginalization
+# and C is the covariance of the full (unmarginalized, but still
+# condition-averaged) data -- this uses the paper's balanced-design
+# simplification that marginalizations are mutually orthogonal, so the
+# cross-covariance between a marginalization and the full data collapses to
+# C_phi. lambda is a ridge penalty, both to keep C invertible (there are
+# usually more neurons than condition x time samples) and to keep the
+# solution from overfitting a handful of noisy trials; it's chosen by
+# cross-validating over single trials (`_choose_regularizer`), mirroring the
+# paper's procedure. Single trials are then projected into each
+# marginalization's axes exactly like ordinary PCA's `.transform()`, so the
+# SAME plotting functions used for the PCA subspace below (outcome
+# trajectories, correct-vs-incorrect distance, ...) can be reused unchanged
+# on the dPCA 'ct' projection -- the direct analogue of the mixed PCA
+# subspace, but with the condition-independent time course factored out.
+
+
+def marginalize_condition_time(cond_avg_rates):
+    """cond_avg_rates: (n_conditions, n_time, n_neurons), already trial-
+    averaged per condition (the same object `build_condition_averages`
+    produces). Returns (X_t, X_c, X_ct, grand_mean), each of shape
+    (n_conditions, n_time, n_neurons) except grand_mean ((n_neurons,)),
+    decomposing cond_avg_rates - grand_mean == X_t + X_c + X_ct."""
+    grand_mean = cond_avg_rates.mean(axis=(0, 1), keepdims=True)
+    centered = cond_avg_rates - grand_mean
+    x_t = centered.mean(axis=0, keepdims=True) * np.ones_like(centered)
+    x_c = centered.mean(axis=1, keepdims=True) * np.ones_like(centered)
+    x_ct = centered - x_t - x_c
+    return x_t, x_c, x_ct, grand_mean.reshape(-1)
+
+
+def _group_indices_by_condition(condition_keys):
+    keys = [tuple(k) if isinstance(k, (tuple, list)) else k for k in condition_keys]
+    groups = {}
+    for i, k in enumerate(keys):
+        groups.setdefault(k, []).append(i)
+    return {k: np.array(v) for k, v in groups.items()}
+
+
+def _solve_dpca(C_phi, C, lam, n_components):
+    """Solve the regularized dPCA generalized eigenproblem
+    C_phi w = gamma (C + lam I) w for one marginalization. Returns the top
+    `n_components` decoder axes D (n_neurons, n_components) and the
+    fraction of TOTAL (unmarginalized) variance each axis captures
+    (D_k^T C D_k / trace(C)) -- comparable across marginalizations, so it
+    can be shown as grouped bars like a scree plot. Only the decoder is
+    kept (not the paper's separate reconstruction encoder), since the only
+    thing used downstream is projecting single trials for trajectory plots."""
+    n = C.shape[0]
+    eigvals, eigvecs = eigh(C_phi, C + lam * np.eye(n))
+    order = np.argsort(eigvals)[::-1][:n_components]
+    D = eigvecs[:, order]
+    # scipy.linalg.eigh(A, B) normalizes eigenvectors so v^T B v == 1, an
+    # arbitrary (and lambda-dependent, since B = C + lam*I) scale unrelated
+    # to how much variance a direction actually captures -- rescale to unit
+    # Euclidean norm so the "explained variance" below, and single-trial
+    # projection magnitudes from `.transform()`, are meaningful and
+    # comparable across marginalizations/components.
+    D = D / np.linalg.norm(D, axis=0, keepdims=True)
+    total_var = np.trace(C)
+    explained = np.array([
+        (D[:, k] @ C @ D[:, k]) / total_var if total_var > 0 else 0.0
+        for k in range(D.shape[1])
+    ])
+    return D, explained
+
+
+def _choose_regularizer(rates, condition_keys, marg, regularizer_grid, mean_, std_,
+                          min_trials=5, n_repeats=5, train_frac=0.75, seed=0):
+    """Cross-validate the ridge penalty lambda for one marginalization:
+    repeatedly split each condition's single trials into a train/test half,
+    average each half separately into train/test condition PSTHs, solve the
+    dPCA eigenproblem from the TRAIN half's covariances at each candidate
+    lambda, and score it by how much of the HELD-OUT test half's
+    marginalized variance those axes capture. Picks the lambda that
+    generalizes to unseen trials, rather than the lambda->0 solution that
+    best (over)fits the training covariance alone -- mirrors the
+    cross-validation in Kobak et al. 2016 (Methods)."""
+    rng = np.random.default_rng(seed)
+    n_neurons = rates.shape[-1]
+    groups = _group_indices_by_condition(condition_keys)
+    usable = {k: idx for k, idx in groups.items() if len(idx) >= max(2 * min_trials, 4)}
+    if len(usable) < 2:
+        return regularizer_grid[len(regularizer_grid) // 4]
+
+    def _cov(tensor):
+        m = tensor.reshape(-1, n_neurons)
+        return (m.T @ m) / max(m.shape[0] - 1, 1)
+
+    scores = np.zeros(len(regularizer_grid))
+    n_valid_repeats = 0
+
+    for _ in range(n_repeats):
+        train_avgs, test_avgs = [], []
+        for idx in usable.values():
+            perm = rng.permutation(idx)
+            n_train = int(round(len(perm) * train_frac))
+            n_train = min(max(n_train, min_trials), len(perm) - min_trials)
+            train_avgs.append(rates[perm[:n_train]].mean(axis=0))
+            test_avgs.append(rates[perm[n_train:]].mean(axis=0))
+
+        train = (np.stack(train_avgs) - mean_) / std_
+        test = (np.stack(test_avgs) - mean_) / std_
+
+        x_t_tr, x_c_tr, x_ct_tr, _ = marginalize_condition_time(train)
+        marg_train = dict(t=x_t_tr, c=x_c_tr, ct=x_ct_tr)[marg]
+        centered_train = train - train.mean(axis=(0, 1), keepdims=True)
+
+        x_t_te, x_c_te, x_ct_te, _ = marginalize_condition_time(test)
+        marg_test_flat = dict(t=x_t_te, c=x_c_te, ct=x_ct_te)[marg].reshape(-1, n_neurons)
+
+        C_train = _cov(centered_train)
+        C_phi_train = _cov(marg_train)
+        n_valid_repeats += 1
+
+        for gi, lam in enumerate(regularizer_grid):
+            eigvals, eigvecs = eigh(C_phi_train, C_train + lam * np.eye(n_neurons))
+            top = eigvecs[:, np.argsort(eigvals)[::-1][:3]]
+            # same rescaling fix as in `_solve_dpca`: without it, larger
+            # lambda -> larger B -> smaller-normed eigenvectors, which
+            # would bias this score toward small lambda regardless of
+            # actual generalization.
+            top = top / np.linalg.norm(top, axis=0, keepdims=True)
+            proj = marg_test_flat @ top
+            total_var = np.sum(marg_test_flat ** 2) + 1e-12
+            scores[gi] += np.sum(proj ** 2) / total_var
+
+    if n_valid_repeats == 0:
+        return regularizer_grid[len(regularizer_grid) // 4]
+    return regularizer_grid[np.argmax(scores)]
+
+
+class DemixedSubspace:
+    """Regularized demixed PCA (dPCA) over the factors 'condition' and
+    'time' (Kobak et al. 2016, eLife) -- see the section comment above for
+    the marginalization math and rationale."""
+
+    MARGINALIZATIONS = ("t", "c", "ct")
+
+    def __init__(self, n_components=3):
+        self.n_components = n_components
+        self.mean_ = None
+        self.std_ = None
+        self.decoders_ = {}                    # marg -> (n_neurons, n_components)
+        self.explained_variance_ratio_ = {}    # marg -> (n_components,)
+        self.regularizer_ = {}                 # marg -> chosen lambda
+
+    def fit(self, cond_avg_rates, rates_for_cv=None, condition_keys_for_cv=None,
+            min_trials_for_cv=5, regularizer_grid=None, n_cv_repeats=5,
+            cv_train_frac=0.75, seed=0):
+        """cond_avg_rates: (n_conditions, n_time, n_neurons) -- the same
+        object `build_condition_averages` returns for the ordinary PCA
+        subspace above.
+
+        rates_for_cv / condition_keys_for_cv: OPTIONAL single-trial data
+        (rates: (n_trials, n_time, n_neurons); condition_keys: per-trial
+        labels, same convention as `build_condition_averages`) used only to
+        cross-validate the ridge regularizer lambda, as in the paper. If
+        omitted, a small fixed lambda from `regularizer_grid` is used
+        instead -- still numerically stable, just not cross-validated."""
+        n_cond, n_time, n_neurons = cond_avg_rates.shape
+        flat = cond_avg_rates.reshape(-1, n_neurons)
+        self.mean_ = flat.mean(axis=0)
+        self.std_ = flat.std(axis=0)
+        self.std_[self.std_ < 1e-8] = 1.0
+        z = (cond_avg_rates - self.mean_) / self.std_
+
+        x_t, x_c, x_ct, _ = marginalize_condition_time(z)
+        centered = z - z.mean(axis=(0, 1), keepdims=True)
+        marg_data = dict(t=x_t, c=x_c, ct=x_ct)
+
+        def _cov(tensor):
+            m = tensor.reshape(-1, n_neurons)
+            return (m.T @ m) / max(m.shape[0] - 1, 1)
+
+        C = _cov(centered)
+
+        if regularizer_grid is None:
+            diag_scale = np.trace(C) / n_neurons
+            regularizer_grid = diag_scale * np.logspace(-4, 2, 15)
+
+        for marg in self.MARGINALIZATIONS:
+            C_phi = _cov(marg_data[marg])
+            if rates_for_cv is not None and condition_keys_for_cv is not None:
+                lam = _choose_regularizer(
+                    rates_for_cv, condition_keys_for_cv, marg, regularizer_grid,
+                    self.mean_, self.std_, min_trials=min_trials_for_cv,
+                    n_repeats=n_cv_repeats, train_frac=cv_train_frac, seed=seed)
+            else:
+                lam = regularizer_grid[len(regularizer_grid) // 4]
+            self.regularizer_[marg] = lam
+            D, evr = _solve_dpca(C_phi, C, lam, self.n_components)
+            self.decoders_[marg] = D
+            self.explained_variance_ratio_[marg] = evr
+        return self
+
+    def transform(self, rates, marginalization):
+        """rates: (..., n_neurons) -> (..., n_components) for ONE
+        marginalization ('t', 'c', or 'ct')."""
+        z = (rates - self.mean_) / self.std_
+        return z @ self.decoders_[marginalization]
 
 
 # ==========================================================================
@@ -435,6 +670,174 @@ def plot_choice_axis(pc_trials, choice_proj, outcome, time_bins, title="", save_
     return fig
 
 
+def plot_dpca_variance_explained(dsubspace, save_path=None):
+    """Grouped-bar analogue of `plot_scree` for dPCA: variance explained
+    (as a fraction of TOTAL population variance, so comparable across
+    marginalizations) by each component, grouped by marginalization."""
+    margs = list(dsubspace.MARGINALIZATIONS)
+    marg_labels = {"t": "pure time\n(condition-independent)",
+                    "c": "pure condition\n(time-independent)",
+                    "ct": "condition x time\n(interaction)"}
+    marg_colors = {"t": "#999999", "c": "#4c72b0", "ct": "#c44e52"}
+    n_comp = dsubspace.n_components
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    width = 0.8 / len(margs)
+    x = np.arange(n_comp)
+    for i, m in enumerate(margs):
+        evr = dsubspace.explained_variance_ratio_[m]
+        ax.bar(x + i * width, evr, width=width, color=marg_colors.get(m),
+                label=marg_labels.get(m, m))
+    ax.set_xticks(x + width * (len(margs) - 1) / 2)
+    ax.set_xticklabels([f"comp {i + 1}" for i in range(n_comp)])
+    ax.set_ylabel("Fraction of total population variance")
+    ax.set_title("dPCA variance explained by marginalization")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig
+
+
+def plot_dpca_component_timecourses(dsubspace, cond_avg_rates, cond_keys, time_bins,
+                                       n_components=3, save_path=None):
+    """Canonical dPCA figure: rows = marginalization, columns = component
+    rank; each panel shows that component's trial-averaged (denoised) time
+    course for every kept condition, colored by outcome when the condition
+    keys carry one (as `(stim_id, context, outcome)` tuples -- see how
+    `condition_keys` is built in `run_real_data_analysis`)."""
+    margs = list(dsubspace.MARGINALIZATIONS)
+    marg_titles = {"t": "pure time", "c": "pure condition", "ct": "condition x time"}
+    fig, axes = plt.subplots(len(margs), n_components,
+                               figsize=(3.6 * n_components, 3.0 * len(margs)),
+                               squeeze=False)
+
+    def _color_for(key):
+        outcome_label = key[-1] if isinstance(key, tuple) and len(key) >= 1 else None
+        return OUTCOME_COLORS.get(outcome_label, "#888888")
+
+    for ri, m in enumerate(margs):
+        proj = dsubspace.transform(cond_avg_rates, m)  # (n_cond, n_time, n_comp)
+        for ci in range(n_components):
+            ax = axes[ri][ci]
+            for k_idx, key in enumerate(cond_keys):
+                ax.plot(time_bins, proj[k_idx, :, ci], color=_color_for(key),
+                         lw=1.2, alpha=0.8)
+            ax.axhline(0, color="grey", lw=0.5, zorder=0)
+            if ri == 0:
+                ax.set_title(f"component {ci + 1}")
+            if ci == 0:
+                ax.set_ylabel(marg_titles[m])
+            if ri == len(margs) - 1:
+                ax.set_xlabel("Time in trial (s)")
+
+    legend_elems = [Line2D([0], [0], color=c, lw=2, label=OUTCOME_LABELS[k])
+                     for k, c in OUTCOME_COLORS.items()]
+    fig.legend(handles=legend_elems, loc="upper right", fontsize=8)
+    fig.suptitle("dPCA component time courses by marginalization")
+    fig.tight_layout(rect=[0, 0, 0.86, 0.96])
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig
+
+
+def plot_reward_vs_outcome_comparison(dsubspace, rates, trial_df, outcome, time_bins,
+                                        out_dir, noncontingent_col="is_noncontingent_reward",
+                                        min_noncontingent=2):
+    """Tests whether a dPCA condition x time (interaction) component that
+    differs by behavioral outcome (e.g. a late ramp specific to hit trials)
+    tracks REWARD specifically, rather than task/decision correctness or the
+    licking motor act itself. Hit trials are correct, rewarded, AND licked,
+    so on their own they can't distinguish those three explanations.
+    Noncontingent ("free") reward trials break that confound: they are
+    rewarded without any correct discrimination being made (and typically
+    without a lick at all). This compares:
+
+      Hit               -- correct, rewarded, licked
+      Noncontingent      -- rewarded, NOT a correct discrimination, no lick
+      Correct reject     -- NOT rewarded, no lick
+
+    If noncontingent trials pattern with Hits, that points to reward as the
+    driver. If they instead pattern with correct-reject, the signal more
+    likely tracks task correctness (or the lick itself, if hits were driving
+    it). Skips (with a printed note) if the trial table doesn't have a
+    noncontingent-reward column or too few such trials exist."""
+    if noncontingent_col not in trial_df.columns:
+        print(f"NOTE: '{noncontingent_col}' not in trial table -- skipping "
+              f"reward-vs-outcome comparison.")
+        return None
+    noncontingent = trial_df[noncontingent_col].to_numpy().astype(bool)
+    n_nc = int(noncontingent.sum())
+    if n_nc < min_noncontingent:
+        print(f"NOTE: only {n_nc} noncontingent-reward trials (need >= "
+              f"{min_noncontingent}) -- skipping reward-vs-outcome comparison.")
+        return None
+
+    hit_idx = np.where(outcome == "hit")[0]
+    cr_idx = np.where(outcome == "correct_reject")[0]
+    nc_idx = np.where(noncontingent)[0]
+    print(f"Reward-vs-outcome comparison: hit n={len(hit_idx)}, "
+          f"noncontingent-reward n={len(nc_idx)}, correct-reject n={len(cr_idx)}")
+
+    dpca_trials_ct = dsubspace.transform(rates, "ct")
+    n_comp = dsubspace.n_components
+
+    groups = [("Hit (correct, rewarded, licked)", hit_idx, "#1b9e77"),
+              ("Noncontingent reward (rewarded, no discrimination)", nc_idx, "#e6ab02"),
+              ("Correct reject (unrewarded, no lick)", cr_idx, "#377eb8")]
+
+    fig, axes = plt.subplots(1, n_comp, figsize=(4.4 * n_comp, 4.4), squeeze=False)
+    for ci in range(n_comp):
+        ax = axes[0][ci]
+        for label, idx, color in groups:
+            if len(idx) == 0:
+                continue
+            vals = dpca_trials_ct[idx, :, ci]
+            m = vals.mean(axis=0)
+            sem = vals.std(axis=0, ddof=1) / np.sqrt(len(idx)) if len(idx) > 1 else np.zeros_like(m)
+            ax.plot(time_bins, m, color=color, lw=2.0, label=f"{label} (n={len(idx)})")
+            ax.fill_between(time_bins, m - sem, m + sem, color=color, alpha=0.2)
+        ax.axhline(0, color="grey", lw=0.5)
+        ax.set_title(f"component {ci + 1}")
+        ax.set_xlabel("Time in trial (s)")
+        if ci == 0:
+            ax.set_ylabel("dPCA condition x time projection (a.u.)")
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.12), fontsize=8)
+    fig.suptitle("Reward vs. behavioral-outcome comparison (dPCA condition x time)", y=1.2)
+    fig.tight_layout()
+    timecourse_path = os.path.join(out_dir, "real_dpca_reward_vs_outcome_timecourses.png")
+    fig.savefig(timecourse_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    plot_trajectory_distance(
+        dpca_trials_ct, hit_idx, nc_idx, time_bins,
+        stim_label="", correct_label="Hit", incorrect_label="Noncontingent reward",
+        n_pcs=n_comp,
+        title="Hit vs. noncontingent-reward trajectory separation (dPCA ct, all components)",
+        save_path=os.path.join(out_dir, "real_dpca_hit_vs_noncontingent_distance.png"),
+    )
+
+    if len(cr_idx) >= 2:
+        plot_trajectory_distance(
+            dpca_trials_ct, nc_idx, cr_idx, time_bins,
+            stim_label="", correct_label="Noncontingent reward", incorrect_label="Correct reject",
+            n_pcs=n_comp,
+            title="Noncontingent-reward vs. correct-reject trajectory separation (dPCA ct)",
+            save_path=os.path.join(out_dir, "real_dpca_noncontingent_vs_correct_reject_distance.png"),
+        )
+
+    print(f"Reward-vs-outcome figures written to {out_dir}/real_dpca_reward_vs_outcome_*.png "
+          f"and {out_dir}/real_dpca_*_distance.png")
+    return dict(dpca_trials_ct=dpca_trials_ct, hit_idx=hit_idx, nc_idx=nc_idx, cr_idx=cr_idx)
+
+
 # ==========================================================================
 # 4. USER CONFIGURATION -- edit this section for your data
 # ==========================================================================
@@ -508,6 +911,12 @@ CONFIG = dict(
     n_components_compare=10,  # extra PCs kept around for the top-N distance comparison plot
     min_trials_per_condition=5,
     out_dir="/tmp",
+
+    # --- dPCA (demixed PCA; see section 1b) ---
+    run_dpca=True,             # set False to skip dPCA and only run ordinary PCA
+    dpca_n_components=3,
+    dpca_cv_repeats=5,         # train/test splits used to cross-validate the ridge penalty
+    dpca_cv_train_frac=0.75,
 )
 
 
@@ -965,8 +1374,72 @@ def run_real_data_analysis(config=CONFIG, spike_table=None, trial_table=None):
         save_path=os.path.join(out_dir, "real_subspace_choice_axis.png"),
     )
 
-    print(f"Done. Figures written to {out_dir}/real_subspace_*.png")
+    # ---- 8e. Demixed PCA (dPCA): same condition-averaged PSTHs as the PCA
+    # subspace above, but split into separate 'pure time' / 'pure condition'
+    # / 'condition x time' axes first (section 1b) so dynamics shared by
+    # every condition don't crowd out the condition-DEPENDENT dynamics in
+    # the same components, the way they can in ordinary PCA.
+    dsubspace = None
+    if cfg.get("run_dpca", True):
+        print("Fitting demixed PCA (dPCA) on the same condition-averaged PSTHs...")
+        dpca_n = cfg.get("dpca_n_components", 3)
+        dsubspace = DemixedSubspace(n_components=dpca_n).fit(
+            cond_avg_rates, rates_for_cv=rates, condition_keys_for_cv=condition_keys,
+            min_trials_for_cv=cfg["min_trials_per_condition"],
+            n_cv_repeats=cfg.get("dpca_cv_repeats", 5),
+            cv_train_frac=cfg.get("dpca_cv_train_frac", 0.75),
+        )
+        for m in dsubspace.MARGINALIZATIONS:
+            print(f"  [{m}] regularizer={dsubspace.regularizer_[m]:.4g}  "
+                  f"variance explained={np.round(dsubspace.explained_variance_ratio_[m], 3)}")
+
+        plot_dpca_variance_explained(
+            dsubspace, save_path=os.path.join(out_dir, "real_dpca_variance_explained.png"))
+        plot_dpca_component_timecourses(
+            dsubspace, cond_avg_rates, cond_keys, time_bins, n_components=dpca_n,
+            save_path=os.path.join(out_dir, "real_dpca_component_timecourses.png"))
+
+        # Direct analogues of the PCA outcome-trajectory / correct-vs-
+        # incorrect figures above (8b/8c), built from the demixed
+        # 'condition x time' component instead of ordinary mixed PCs --
+        # reuses the exact same plotting functions since they only require
+        # a (n_trials, n_time, n_components) projection array. The
+        # secondary comparisons (8c-2, 8c-3) can be produced the same way
+        # by swapping pc_trials for dpca_trials_ct.
+        dpca_trials_ct = dsubspace.transform(rates, "ct")
+
+        plot_outcome_trajectories(
+            dpca_trials_ct, outcome, pcx=0, pcy=1,
+            title="Single-trial trajectories by outcome (dPCA condition x time component)",
+            save_path=os.path.join(out_dir, "real_dpca_outcomes.png"),
+        )
+
+        for stim, modality in unique_stims:
+            is_this_stim = (stim_id == stim)
+            matched_ctx = is_this_stim & (context == modality) & (outcome == "hit")
+            mismatched_ctx = is_this_stim & (context != modality) & (outcome == "false_alarm")
+            if len(matched_ctx.nonzero()[0]) >= 2 and len(mismatched_ctx.nonzero()[0]) >= 2:
+                correct_idx = np.where(matched_ctx)[0]
+                incorrect_idx = np.where(mismatched_ctx)[0]
+                plot_stim_correct_vs_incorrect(
+                    dpca_trials_ct, correct_idx, incorrect_idx, time_bins,
+                    stim_label=str(stim),
+                    correct_label=f"Correct {stim} (matched context, hit)",
+                    incorrect_label=f"Incorrect {stim} (mismatched context, false alarm)",
+                    pcx=0, pcy=1,
+                    title=f"Correct vs. incorrect {stim} response, dPCA condition x time component",
+                    save_path=os.path.join(
+                        out_dir, f"real_dpca_{stim}_correct_vs_incorrect.png"),
+                )
+
+        plot_reward_vs_outcome_comparison(
+            dsubspace, rates, trial_df, outcome, time_bins, out_dir)
+
+    print(f"Done. Figures written to {out_dir}/real_subspace_*.png"
+          + (f" and {out_dir}/real_dpca_*.png" if dsubspace is not None else ""))
     return dict(rates=rates, subspace=subspace, pc_trials=pc_trials,
+                 dpca_subspace=dsubspace,
+                 dpca_trials_ct=(dsubspace.transform(rates, "ct") if dsubspace is not None else None),
                  stim_id=stim_id, context=context, outcome=outcome,
                  choice_proj=choice_proj, time_bins=time_bins)
 
